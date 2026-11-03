@@ -1,0 +1,10 @@
+{
+	"id": "obsidian-yandex-tracker-sync",
+	"name": "Yandex Tracker Sync",
+	"version": "1.0.0",
+	"minAppVersion": "1.5.0",
+	"description": "Bidirectional sync between Obsidian checklist tasks and Yandex Tracker boards.",
+	"author": "Stan Bogatkin",
+	"authorUrl": "https://github.com/sorrowless",
+	"isDesktopOnly": false
+}

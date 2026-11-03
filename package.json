@@ -1,0 +1,28 @@
+{
+  "name": "obsidian-yandex-tracker-sync",
+  "version": "1.0.0",
+  "description": "Bidirectional sync between Obsidian checklist tasks and Yandex Tracker boards.",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "vitest run",
+    "version": "node version-bump.mjs && git add manifest.json versions.json"
+  },
+  "keywords": [
+    "obsidian",
+    "yandex-tracker",
+    "tracker",
+    "tasks",
+    "sync"
+  ],
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^22.15.17",
+    "esbuild": "0.25.5",
+    "obsidian": "latest",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
