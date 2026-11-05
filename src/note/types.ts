@@ -23,8 +23,23 @@ export interface ParsedTaskNode {
   status: TaskStatus | null;
   /** Task title (link text when linked, otherwise body without date tokens). */
   title: string;
-  /** Tracker issue key when the body is a browse link to this site. */
+  /**
+   * Tracker issue key when known: classic title browse link, or `[ytracker::]`.
+   */
   issueKey: string | null;
+  /**
+   * URL of the leading markdown title link (Tracker or external), or null when
+   * the title is plain text.
+   */
+  titleLinkUrl: string | null;
+  /**
+   * Key from `[ytracker:: …]` when present (dual-link mode). May equal `issueKey`.
+   */
+  ytrackerIssueKey: string | null;
+  /**
+   * Raw unknown Dataview fields `[key:: value]` preserved across rewrites.
+   */
+  unknownInlineFields: string[];
   /** ISO UTC start time, or null when unset. */
   startDate: string | null;
   /** ISO UTC due time, or null when unset. From Tracker end/deadline; pushes to deadline. */

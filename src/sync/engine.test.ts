@@ -61,6 +61,7 @@ interface MockClientBundle {
   transitionTowardStatuses: ReturnType<typeof vi.fn>;
   getIssue: ReturnType<typeof vi.fn>;
   findIssuesByKeys: ReturnType<typeof vi.fn>;
+  findIssueByExactSummary: ReturnType<typeof vi.fn>;
 }
 
 function createMockClient(initial: TrackerIssue[] = []): MockClientBundle {
@@ -114,6 +115,15 @@ function createMockClient(initial: TrackerIssue[] = []): MockClientBundle {
     return found;
   });
 
+  const findIssueByExactSummary = vi.fn(async (_queueKey: string, summary: string) => {
+    for (const row of issues.values()) {
+      if (String(row.summary ?? '').trim() === summary.trim()) {
+        return structuredClone(row);
+      }
+    }
+    return null;
+  });
+
   const createIssue = vi.fn(async (input: CreateIssueInput) => {
     const key = `PROJ-${nextId}`;
     nextId += 1;
@@ -151,6 +161,9 @@ function createMockClient(initial: TrackerIssue[] = []): MockClientBundle {
     }
     if (input.deadline !== undefined) {
       row.deadline = input.deadline;
+    }
+    if (input.end !== undefined) {
+      row.end = input.end;
     }
     row.updatedAt = '2026-06-01T12:00:01.000Z';
     return structuredClone(row);
@@ -207,6 +220,7 @@ function createMockClient(initial: TrackerIssue[] = []): MockClientBundle {
     transitionTowardStatuses,
     getIssue,
     findIssuesByKeys,
+    findIssueByExactSummary,
   } as unknown as TrackerClient;
 
   return {
@@ -218,6 +232,7 @@ function createMockClient(initial: TrackerIssue[] = []): MockClientBundle {
     transitionTowardStatuses,
     getIssue,
     findIssuesByKeys,
+    findIssueByExactSummary,
   };
 }
 
@@ -391,6 +406,52 @@ describe('sync engine', () => {
     expect(written).toContain('- Line one');
   });
 
+  it('creates Tracker issue for external title link and writes ytracker field', async () => {
+    const mock = createMockClient();
+    const { written } = await runSync({
+      note: '- [ ] [Jira title](https://jira.example/browse/ABC-1)',
+      mock,
+    });
+    expect(mock.createIssue).toHaveBeenCalledTimes(1);
+    expect((mock.createIssue.mock.calls[0]?.[0] as CreateIssueInput).summary).toBe('Jira title');
+    expect(written).toContain('[Jira title](https://jira.example/browse/ABC-1)');
+    expect(written).toContain('[ytracker:: [PROJ-100](https://tracker.example/PROJ-100)]');
+    expect(written).not.toMatch(/\[Jira title\]\(https:\/\/tracker\.example\//);
+  });
+
+  it('binds external title link to existing Tracker issue by summary', async () => {
+    const mock = createMockClient([issueRow('PROJ-77', 'Shared name')]);
+    const { written } = await runSync({
+      note: '- [ ] [Shared name](https://jira.example/browse/ABC-9)',
+      mock,
+    });
+    expect(mock.createIssue).not.toHaveBeenCalled();
+    expect(mock.findIssueByExactSummary).toHaveBeenCalledWith('PROJ', 'Shared name');
+    expect(written).toContain('[Shared name](https://jira.example/browse/ABC-9)');
+    expect(written).toContain('[ytracker:: [PROJ-77](https://tracker.example/PROJ-77)]');
+  });
+
+  it('pulls Tracker rename into external link text while keeping the URL', async () => {
+    const mock = createMockClient([
+      issueRow('PROJ-88', 'New Tracker name', {
+        updatedAt: '2026-02-01T00:00:00.000Z',
+      }),
+    ]);
+    const { written } = await runSync({
+      note: '- [ ] [Old name](https://jira.example/browse/ABC-2) [ytracker:: [PROJ-88](https://tracker.example/PROJ-88)]',
+      mock,
+      ledger: seedLedger('PROJ-88', 'Old name', {
+        status: 'todo',
+        trackerStatusId: 'open',
+        trackerStatusName: 'Open',
+        trackerUpdated: '2026-01-01T00:00:00.000Z',
+      }),
+      conflictPolicy: 'prefer-tracker',
+    });
+    expect(written).toContain('[New Tracker name](https://jira.example/browse/ABC-2)');
+    expect(written).toContain('[ytracker:: [PROJ-88](https://tracker.example/PROJ-88)]');
+  });
+
   it('imports blocked remote issues as review checkbox and restores missing locals', async () => {
     const mock = createMockClient([
       issueRow('PROJ-80', 'Stuck waiting', {
@@ -435,6 +496,154 @@ describe('sync engine', () => {
     expect(result.mappings[0]?.counts.pulled).toBe(1);
     expect(writeNote).toHaveBeenCalledTimes(1);
     expect(written).toContain('[Remote title]');
+  });
+
+  it('skips duplicate Tracker keys instead of pushing the second checklist line', async () => {
+    const mock = createMockClient([
+      issueRow('PROJ-90', 'Shared title', {
+        description: 'canonical description from Tracker',
+        status: { id: '4', key: 'closed', display: 'Closed' },
+      }),
+    ]);
+    const note = [
+      '- [x] [Shared title](https://jira.example/browse/AAA-1) [ytracker:: [PROJ-90](https://tracker.example/PROJ-90)]',
+      '    - canonical description from Tracker',
+      '- [x] [Shared title](https://jira.example/browse/BBB-2) [ytracker:: [PROJ-90](https://tracker.example/PROJ-90)]',
+      '    - different local description that must not push',
+    ].join('\n');
+
+    const { result } = await runSync({ note, mock });
+
+    expect(result.mappings[0]?.counts.pushed).toBe(0);
+    expect(result.mappings[0]?.counts.conflictsResolved).toBe(0);
+    expect(result.mappings[0]?.counts.duplicateSkips).toBe(1);
+    expect(result.mappings[0]?.counts.unchanged).toBe(1);
+    expect(
+      result.mappings[0]?.actions.some(
+        (action) => action.kind === 'duplicate-skip' && action.issueKey === 'PROJ-90',
+      ),
+    ).toBe(true);
+    expect(
+      mock.updateIssue.mock.calls.some((call) => call[1]?.description !== undefined),
+    ).toBe(false);
+    expect(result.message).toMatch(/duplicate link/);
+  });
+
+  it('does not push on a second idle sync when note and Tracker share the same dates', async () => {
+    const mock = createMockClient([
+      issueRow('PROJ-40', 'Dated', {
+        start: '2026-10-01',
+        deadline: '2026-10-05',
+        updatedAt: '2026-03-01T00:00:00.000Z',
+      }),
+    ]);
+    const note = `${link('PROJ-40', 'Dated')} 🛫 2026-10-01 📅 2026-10-05`;
+    const first = await runSync({ note, mock });
+    expect(first.result.mappings[0]?.counts.pushed).toBe(0);
+    expect(first.result.mappings[0]?.counts.conflictsResolved).toBe(0);
+    expect(first.result.mappings[0]?.counts.unchanged).toBe(1);
+
+    const second = await runSync({ note, mock, ledger: first.ledger });
+    expect(second.result.mappings[0]?.counts.pushed).toBe(0);
+    expect(second.result.mappings[0]?.counts.pulled).toBe(0);
+    expect(second.result.mappings[0]?.counts.unchanged).toBe(1);
+    expect(
+      mock.updateIssue.mock.calls.filter(
+        (call) => call[1]?.summary !== undefined || call[1]?.start !== undefined,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it('clears Tracker end when pushing a new Obsidian due date', async () => {
+    const mock = createMockClient([
+      issueRow('PROJ-41', 'Due end', {
+        end: '2026-10-03',
+        deadline: '2026-10-10',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      }),
+    ]);
+    const { ledger } = await runSync({
+      note: `${link('PROJ-41', 'Due end')} 📅 2026-10-03\n`,
+      mock,
+      conflictPolicy: 'prefer-tracker',
+    });
+    await runSync({
+      note: `${link('PROJ-41', 'Due end')} 📅 2026-11-15\n`,
+      mock,
+      ledger,
+      conflictPolicy: 'prefer-obsidian',
+    });
+    const duePush = mock.updateIssue.mock.calls.find(
+      (call) => call[0] === 'PROJ-41' && call[1]?.deadline === '2026-11-15',
+    );
+    expect(duePush?.[1]?.end).toBeNull();
+  });
+
+  it('treats agreeing sides as unchanged even with a stale ledger', async () => {
+    const mock = createMockClient([
+      issueRow('PROJ-30', 'Same title', { updatedAt: '2026-03-01T00:00:00.000Z' }),
+    ]);
+    const { result, writeNote } = await runSync({
+      note: link('PROJ-30', 'Same title'),
+      mock,
+      ledger: seedLedger('PROJ-30', 'Outdated ledger title', {
+        trackerUpdated: '2026-01-01T00:00:00.000Z',
+      }),
+    });
+
+    expect(result.mappings[0]?.counts.conflictsResolved).toBe(0);
+    expect(result.mappings[0]?.counts.pushed).toBe(0);
+    expect(result.mappings[0]?.counts.pulled).toBe(0);
+    expect(result.mappings[0]?.counts.unchanged).toBe(1);
+    // Tag reconcile may still call updateIssue; content push must not.
+    expect(
+      mock.updateIssue.mock.calls.some(
+        (call) => call[1]?.summary !== undefined || call[1]?.description !== undefined,
+      ),
+    ).toBe(false);
+    expect(writeNote).not.toHaveBeenCalled();
+    expect(result.message).toMatch(/unchanged|nothing to do/);
+  });
+
+  it('does not re-conflict on a second idle sync', async () => {
+    const mock = createMockClient([issueRow('PROJ-31', 'Stable')]);
+    const first = await runSync({
+      note: link('PROJ-31', 'Stable'),
+      mock,
+    });
+    expect(first.result.mappings[0]?.counts.conflictsResolved).toBe(0);
+    expect(first.result.mappings[0]?.counts.unchanged).toBe(1);
+
+    const second = await runSync({
+      note: link('PROJ-31', 'Stable'),
+      mock,
+      ledger: first.ledger,
+    });
+    expect(second.result.mappings[0]?.counts.conflictsResolved).toBe(0);
+    expect(second.result.mappings[0]?.counts.pushed).toBe(0);
+    expect(second.result.mappings[0]?.counts.pulled).toBe(0);
+    expect(second.result.mappings[0]?.counts.unchanged).toBe(1);
+    expect(second.result.message).toMatch(/unchanged|nothing to do/);
+  });
+
+  it('ignores trackerUpdated bumps when content hashes still match', async () => {
+    const mock = createMockClient([
+      issueRow('PROJ-32', 'Tagged', {
+        updatedAt: '2026-04-01T12:00:00.000Z',
+        tags: ['to-do'],
+      }),
+    ]);
+    const { result } = await runSync({
+      note: link('PROJ-32', 'Tagged'),
+      mock,
+      ledger: seedLedger('PROJ-32', 'Tagged', {
+        trackerUpdated: '2026-01-01T00:00:00.000Z',
+      }),
+    });
+
+    expect(result.mappings[0]?.counts.conflictsResolved).toBe(0);
+    expect(result.mappings[0]?.counts.pulled).toBe(0);
+    expect(result.mappings[0]?.counts.unchanged).toBe(1);
   });
 
   it('resolves conflicts with prefer-obsidian by pushing', async () => {
@@ -591,7 +800,7 @@ describe('sync engine', () => {
     expect(written).toContain('[timespent:: 3600]');
   });
 
-  it('pushes Obsidian due date to deadline only', async () => {
+  it('pushes Obsidian due date to deadline and clears stale Tracker end', async () => {
     const mock = createMockClient([
       issueRow('PROJ-51', 'Due push', { deadline: '2026-10-10', end: '2026-10-03' }),
     ]);
@@ -614,9 +823,7 @@ describe('sync engine', () => {
       (call) => call[0] === 'PROJ-51' && call[1]?.deadline === '2026-11-15',
     );
     expect(duePush).toBeTruthy();
-    const endWrites = mock.updateIssue.mock.calls.filter(
-      (call) => (call[1] as Record<string, unknown>)?.end !== undefined,
-    );
-    expect(endWrites).toHaveLength(0);
+    // `end` wins over `deadline` on read-back — must clear it when pushing due.
+    expect(duePush?.[1]?.end).toBeNull();
   });
 });

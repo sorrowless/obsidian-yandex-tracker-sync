@@ -9,6 +9,7 @@ export type SyncActionKind =
   | 'unresolved-missing-remote'
   | 'unresolved-missing-local'
   | 'recovered-pending'
+  | 'duplicate-skip'
   | 'reconcile-labels'
   | 'reconcile-assignee'
   | 'reconcile-timespent'
@@ -50,6 +51,8 @@ export function formatActionLabel(kind: SyncActionKind, dryRun: boolean): string
       return 'Unresolved — known from ledger, missing in note';
     case 'recovered-pending':
       return `${prefix}relink pending Tracker issue`;
+    case 'duplicate-skip':
+      return 'Skipped duplicate link in note';
     case 'reconcile-labels':
       return `${prefix}align status labels with board column`;
     case 'reconcile-assignee':
@@ -75,6 +78,7 @@ export const ACTION_REPORT_ORDER: SyncActionKind[] = [
   'conflict-pull',
   'derive-start',
   'recovered-pending',
+  'duplicate-skip',
   'reconcile-labels',
   'reconcile-assignee',
   'reconcile-timespent',

@@ -1,8 +1,10 @@
 import { extractIssueKeyFromUrl, parseMarkdownLinkAtStart } from '../tracker/urls';
 import { parseAssigneeField } from './assignee';
 import { parseTaskDates } from './dates';
+import { parseUnknownInlineFields } from './inline-fields';
 import { parseTimeSpentField } from './timespent';
 import type { ParseNoteOptions, ParsedTaskNode } from './types';
+import { parseYtrackerField } from './ytracker';
 import {
   doneFlagFromStatus,
   statusFromCheckbox,
@@ -24,6 +26,9 @@ interface FlatTask {
   status: TaskStatus | null;
   title: string;
   issueKey: string | null;
+  titleLinkUrl: string | null;
+  ytrackerIssueKey: string | null;
+  unknownInlineFields: string[];
   startDate: string | null;
   dueDate: string | null;
   assignee: string | null;
@@ -69,6 +74,9 @@ export function parseNoteTasks(markdown: string, options: ParseNoteOptions): Par
         status,
         title: resolved.title,
         issueKey: resolved.issueKey,
+        titleLinkUrl: resolved.titleLinkUrl,
+        ytrackerIssueKey: resolved.ytrackerIssueKey,
+        unknownInlineFields: resolved.unknownInlineFields,
         startDate: resolved.startDate,
         dueDate: resolved.dueDate,
         assignee: resolved.assignee,
@@ -117,32 +125,38 @@ function resolveTaskBody(
 ): {
   title: string;
   issueKey: string | null;
+  titleLinkUrl: string | null;
+  ytrackerIssueKey: string | null;
+  unknownInlineFields: string[];
   startDate: string | null;
   dueDate: string | null;
   assignee: string | null;
   timeSpentSeconds: number | null;
 } {
   const linkMatch = parseMarkdownLinkAtStart(body);
-  if (linkMatch) {
-    const withTime = parseTimeSpentField(linkMatch.rest);
-    const withAssignee = parseAssigneeField(withTime.remainder);
-    const dates = parseTaskDates(withAssignee.remainder);
-    return {
-      title: linkMatch.title.trim() || dates.remainder,
-      issueKey: extractIssueKeyFromUrl(linkMatch.url, trackerSiteBaseUrl),
-      startDate: dates.startDate,
-      dueDate: dates.dueDate,
-      assignee: withAssignee.assignee,
-      timeSpentSeconds: withTime.timeSpentSeconds,
-    };
-  }
+  const afterTitle = linkMatch ? linkMatch.rest : body;
 
-  const withTime = parseTimeSpentField(body);
+  // Identity first, then known Dataview fields, then dates / unknowns.
+  const withYtracker = parseYtrackerField(afterTitle, trackerSiteBaseUrl);
+  const withTime = parseTimeSpentField(withYtracker.remainder);
   const withAssignee = parseAssigneeField(withTime.remainder);
-  const dates = parseTaskDates(withAssignee.remainder);
+  const withUnknown = parseUnknownInlineFields(withAssignee.remainder);
+  const dates = parseTaskDates(withUnknown.remainder);
+
+  const titleFromLink = linkMatch ? linkMatch.title.trim() : '';
+  const titleLinkUrl = linkMatch ? linkMatch.url.trim() : null;
+  const classicKey = linkMatch
+    ? extractIssueKeyFromUrl(linkMatch.url, trackerSiteBaseUrl)
+    : null;
+  const ytrackerIssueKey = withYtracker.ytrackerIssueKey;
+  const issueKey = classicKey ?? ytrackerIssueKey;
+
   return {
-    title: dates.remainder,
-    issueKey: null,
+    title: titleFromLink || dates.remainder,
+    issueKey,
+    titleLinkUrl,
+    ytrackerIssueKey,
+    unknownInlineFields: withUnknown.unknownInlineFields,
     startDate: dates.startDate,
     dueDate: dates.dueDate,
     assignee: withAssignee.assignee,
@@ -198,6 +212,9 @@ function buildTree(tasks: FlatTask[]): ParsedTaskNode[] {
       status: flat.status,
       title: flat.title,
       issueKey: flat.issueKey,
+      titleLinkUrl: flat.titleLinkUrl,
+      ytrackerIssueKey: flat.ytrackerIssueKey,
+      unknownInlineFields: [...flat.unknownInlineFields],
       startDate: flat.startDate,
       dueDate: flat.dueDate,
       assignee: flat.assignee,

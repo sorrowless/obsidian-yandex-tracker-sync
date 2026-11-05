@@ -1,3 +1,4 @@
+import { formatDateForNote } from '../note/dates';
 import { htmlToPlainText } from './html-to-text';
 import {
   isTaskStatus,
@@ -140,16 +141,48 @@ export function contentSnapshot(input: {
 
 export function contentHash(snapshot: ContentSnapshot): string {
   const payload = [
-    snapshot.title,
+    snapshot.title.trim(),
     snapshot.description,
     snapshot.status,
     snapshot.trackerStatusId,
     snapshot.trackerStatusName,
     snapshot.parentIssueKey === null ? '' : snapshot.parentIssueKey,
-    snapshot.startDate ?? '',
-    snapshot.dueDate ?? '',
+    // Compare calendar days, not raw ISO: Tracker date-only values and
+    // Obsidian local-midnight parses often differ by timezone offset while
+    // meaning the same day — that used to cause perpetual push/pull.
+    syncCalendarDay(snapshot.startDate) ?? '',
+    syncCalendarDay(snapshot.dueDate) ?? '',
   ].join('\0');
   return fnv1aHex(payload);
+}
+
+/**
+ * Calendar day in the local timezone (`YYYY-MM-DD`), or null when unset.
+ * Sync identity for start/due should be the day, not the exact ISO instant.
+ */
+export function syncCalendarDay(iso: string | null | undefined): string | null {
+  if (!iso) {
+    return null;
+  }
+  const formatted = formatDateForNote(iso);
+  const day = formatted.slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : null;
+}
+
+/**
+ * Syncable fields excluding Tracker column identity.
+ * Used to detect "both sides already agree" even when the local snapshot has no
+ * ledger-backed trackerStatusId yet (first link / empty ledger entry).
+ */
+export function contentCoreEqual(a: ContentSnapshot, b: ContentSnapshot): boolean {
+  return (
+    a.title.trim() === b.title.trim() &&
+    a.description === b.description &&
+    a.status === b.status &&
+    (a.parentIssueKey ?? null) === (b.parentIssueKey ?? null) &&
+    syncCalendarDay(a.startDate) === syncCalendarDay(b.startDate) &&
+    syncCalendarDay(a.dueDate) === syncCalendarDay(b.dueDate)
+  );
 }
 
 export function snapshotFromLedger(entry: LedgerEntry): ContentSnapshot {

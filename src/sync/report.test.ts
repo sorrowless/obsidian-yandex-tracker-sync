@@ -22,6 +22,7 @@ function sampleResult(overrides?: Partial<SyncRunResult>): SyncRunResult {
           unchanged: 0,
           unresolvedRemovals: 1,
           recoveredPendingLinks: 0,
+          duplicateSkips: 0,
           labelReconciliations: 0,
           assigneeReconciliations: 0,
           timeSpentReconciliations: 0,
