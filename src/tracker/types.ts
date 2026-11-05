@@ -140,6 +140,11 @@ export interface UpdateIssueInput {
   tags?: string[];
   start?: string | null;
   deadline?: string | null;
+  /**
+   * Tracker `end` (due). Obsidian syncs due → `deadline` only; set `null` when
+   * writing deadline so a stale `end` does not keep winning on read-back.
+   */
+  end?: string | null;
   /** Login/uid string, or `null` to clear. */
   assignee?: string | null;
 }

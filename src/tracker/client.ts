@@ -9,9 +9,11 @@ import {
   boardScopeQuery,
   columnStatusesClause,
   combineQueryParts,
+  escapeQueryLiteral,
   isBlockedColumnName,
   pausedStatusTypeClause,
   queueScopeQuery,
+  quoteQueryValue,
   type RecencyFilter,
 } from './query';
 import {
@@ -380,6 +382,27 @@ export class TrackerClient {
   }
 
   /**
+   * Find one issue in a queue whose summary equals `summary` exactly.
+   * Uses Tracker exact-phrase syntax `Summary: #"…"`.
+   */
+  async findIssueByExactSummary(
+    queueKey: string,
+    summary: string,
+  ): Promise<TrackerIssue | null> {
+    const queue = queueKey.trim();
+    const title = summary.trim();
+    if (!queue || !title) {
+      return null;
+    }
+    const query = `Queue: ${quoteQueryValue(queue)} AND Summary: #"${escapeQueryLiteral(title)}"`;
+    const issues = await this.searchIssues(query, 20);
+    const exact = issues.find(
+      (issue) => String(issue.summary ?? '').trim() === title,
+    );
+    return exact ?? null;
+  }
+
+  /**
    * Resolve issues by key. Prefers a single search query (works even when GET
    * /issues/{key} 404s for some org setups), then falls back to per-key GET.
    */
@@ -491,6 +514,9 @@ export class TrackerClient {
     }
     if (input.deadline !== undefined) {
       body.deadline = input.deadline;
+    }
+    if (input.end !== undefined) {
+      body.end = input.end;
     }
     if (input.assignee !== undefined) {
       body.assignee = input.assignee;

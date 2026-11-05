@@ -18,6 +18,27 @@ After the first sync that creates the issue in Tracker, the line becomes a link:
 
 The link text is the title. The URL points at the Tracker issue page (`{siteBaseUrl}/{KEY}`).
 
+## Dual-link titles (external URL + Tracker)
+
+When the checklist title is already a markdown link to a **non-Tracker** site (for example Jira), sync does **not** replace that URL. Instead it binds (or creates) a Tracker issue and stores the Tracker identity in a Dataview field:
+
+```markdown
+- [/] [Shared work item](https://jira.example/browse/ABC-1) [ytracker:: [CL-406](https://tracker.yandex.ru/CL-406)]
+```
+
+| Situation | Behavior |
+| --- | --- |
+| Title link is already this Tracker site | Classic path — key lives in the title URL; no `ytracker` field |
+| Title link is external + `[ytracker:: …]` present | Bind by the key/URL inside `ytracker` |
+| Title link is external, no `ytracker` | Search the mapping queue for an issue whose summary equals the link text; create if missing; write `[ytracker:: [KEY](site/KEY)]` |
+| Tracker renames the issue | Only the **display text** of the external title link is updated; the external URL and the `ytracker` field stay as-is |
+| Tracker status/column changes | Checkbox updates as usual via the key from `ytracker` |
+| Unknown Dataview fields (`[jira:: …]`, etc.) | Ignored for sync and preserved on rewrite |
+
+The `ytracker` value is the issue key as a browse link (`[CL-406](…)`), not the human title — queue key and number are stable.
+
+**One Tracker key per checklist line.** If several rows reuse the same `[ytracker:: [CL-N](…)]` (for example two Jira tickets pointed at one Tracker issue), only the **first** row in the note is synced. Later duplicates are reported as skipped and left untouched — otherwise their different descriptions would thrash push/pull on every run.
+
 ## Start and due dates
 
 Start and due dates live **after** the title link (not inside the `[...]` brackets):

@@ -149,6 +149,29 @@ describe('TrackerClient', () => {
     expect(issues[0]?.key).toBe('DOC-1');
   });
 
+  it('findIssueByExactSummary uses exact Summary phrase query', async () => {
+    const client = new TrackerClient({
+      apiBaseUrl: 'https://api.tracker.yandex.net',
+      oauthToken: 'tok',
+      orgId: 'org-1',
+      orgIdHeader: 'X-Org-ID',
+      transport: mockTransport((request) => {
+        if (request.url.includes('/issues/_search')) {
+          expect(JSON.parse(request.body ?? '{}').query).toBe(
+            'Queue: CL AND Summary: #"Shared title"',
+          );
+          return {
+            status: 200,
+            text: JSON.stringify([{ id: '1', key: 'CL-9', summary: 'Shared title' }]),
+          };
+        }
+        return { status: 404, text: 'missing' };
+      }),
+    });
+    const found = await client.findIssueByExactSummary('CL', 'Shared title');
+    expect(found?.key).toBe('CL-9');
+  });
+
   it('findIssuesByKeys searches by Key: then falls back to GET', async () => {
     const client = new TrackerClient({
       apiBaseUrl: 'https://api.tracker.yandex.net',

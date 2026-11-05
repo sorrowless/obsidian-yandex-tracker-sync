@@ -43,6 +43,19 @@ describe('parseNoteTasks', () => {
     );
     expect(roots[0]?.issueKey).toBeNull();
     expect(roots[0]?.title).toBe('X');
+    expect(roots[0]?.titleLinkUrl).toBe('https://other.example/PROJ-1');
+  });
+
+  it('binds issueKey from ytracker when title link is external', () => {
+    const roots = parseNoteTasks(
+      '- [/] [Jira title](https://jira.example/browse/ABC-1) [ytracker:: [CL-406](https://tracker.example/CL-406)] [jira:: keep]',
+      { trackerSiteBaseUrl: BASE },
+    );
+    expect(roots[0]?.title).toBe('Jira title');
+    expect(roots[0]?.titleLinkUrl).toBe('https://jira.example/browse/ABC-1');
+    expect(roots[0]?.ytrackerIssueKey).toBe('CL-406');
+    expect(roots[0]?.issueKey).toBe('CL-406');
+    expect(roots[0]?.unknownInlineFields).toEqual(['[jira:: keep]']);
   });
 
   it('parses Dataview assignee fields', () => {

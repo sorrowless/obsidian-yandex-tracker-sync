@@ -4,6 +4,7 @@ import type { TrackerClient } from '../tracker/client';
 import { describeIssueSyncFilter } from '../tracker/issue-filter';
 import { buildRecencyClause, type RecencyField, type RecencyUnit } from '../tracker/query';
 import type { TrackerIssue } from '../tracker/types';
+import { extractIssueKeyFromUrl } from '../tracker/urls';
 import {
   mappingRecencyFilter,
   type ConflictPolicy,
@@ -29,7 +30,7 @@ import { reconcileStatusLabels, desiredStatusLabel } from './labels';
 import {
   cloneLedger,
   commitMappingLedger,
-  contentHash,
+  contentCoreEqual,
   contentSnapshot,
   descriptionFromLines,
   descriptionToLines,
@@ -37,6 +38,8 @@ import {
   makeLedgerEntry,
   mappingKey,
   normalizeDescription,
+  snapshotFromLedger,
+  syncCalendarDay,
   type ContentSnapshot,
   type LedgerEntry,
   type LedgerStore,
@@ -98,6 +101,7 @@ export interface MappingSyncCounts {
   unchanged: number;
   unresolvedRemovals: number;
   recoveredPendingLinks: number;
+  duplicateSkips: number;
   labelReconciliations: number;
   assigneeReconciliations: number;
   timeSpentReconciliations: number;
@@ -137,6 +141,12 @@ interface MutableTask {
   title: string;
   descriptionLines: string[];
   issueKey: string | null;
+  /** Leading title-link URL (Tracker or external), or null for plain titles. */
+  titleLinkUrl: string | null;
+  /** Key from `[ytracker::]` when in dual-link mode. */
+  ytrackerIssueKey: string | null;
+  /** Unknown Dataview `[key:: value]` segments preserved on rewrite. */
+  unknownInlineFields: string[];
   startDate: string | null;
   dueDate: string | null;
   assignee: string | null;
@@ -339,7 +349,13 @@ export async function syncOneMapping(
   walkMutable(roots, (task) => {
     localOrder.push(task);
     if (task.issueKey !== null) {
-      localByKey.set(task.issueKey.toUpperCase(), task);
+      const issueKey = task.issueKey.toUpperCase();
+      // First occurrence wins: later checklist rows that reuse the same
+      // Tracker key (common with dual-link / copied Jira lines) must not
+      // overwrite the canonical local view used for parent lookup + sync.
+      if (!localByKey.has(issueKey)) {
+        localByKey.set(issueKey, task);
+      }
     }
   });
 
@@ -372,6 +388,7 @@ export async function syncOneMapping(
   }
 
   const mappingPending = pendingLinks.filter((item) => item.mappingKey === key);
+  const syncedIssueKeys = new Set<string>();
 
   for (const local of localOrder) {
     const parentIssueKey = local.parent?.issueKey?.toUpperCase() ?? null;
@@ -380,10 +397,27 @@ export async function syncOneMapping(
       const recovered = takePendingMatch(mappingPending, local.title, parentIssueKey);
       if (recovered) {
         const issueKey = recovered.issueKey.toUpperCase();
+        if (syncedIssueKeys.has(issueKey)) {
+          counts.duplicateSkips += 1;
+          actions.push({
+            kind: 'duplicate-skip',
+            title: local.title,
+            issueKey,
+            detail:
+              'pending relink skipped; another checklist line already syncs this Tracker key',
+          });
+          continue;
+        }
         local.issueKey = issueKey;
+        if (isExternalTitleLink(local, options.siteBaseUrl)) {
+          local.ytrackerIssueKey = issueKey;
+        }
         local.dirty = true;
         markRootDirty(local);
-        localByKey.set(issueKey, local);
+        if (!localByKey.has(issueKey)) {
+          localByKey.set(issueKey, local);
+        }
+        syncedIssueKeys.add(issueKey);
         writeLedgerFromLocal(
           workingLedger,
           key,
@@ -410,6 +444,56 @@ export async function syncOneMapping(
       if (!ctx.queueKey) {
         errors.push(`Create remote "${local.title}": queue key is unknown`);
         continue;
+      }
+
+      const external = isExternalTitleLink(local, options.siteBaseUrl);
+
+      // Dual-link: try to bind an existing Tracker issue by exact summary first.
+      if (external && !dryRun) {
+        try {
+          const matched = await options.client.findIssueByExactSummary(
+            ctx.queueKey,
+            local.title,
+          );
+          if (matched) {
+            const view = toRemoteIssueView(matched, ctx.columns, {
+              statusMeta: ctx.statusMeta,
+            });
+            if (syncedIssueKeys.has(view.key)) {
+              counts.duplicateSkips += 1;
+              actions.push({
+                kind: 'duplicate-skip',
+                title: local.title,
+                issueKey: view.key,
+                detail:
+                  'bind-by-title skipped; another checklist line already syncs this Tracker key',
+              });
+              continue;
+            }
+            local.issueKey = view.key;
+            local.ytrackerIssueKey = view.key;
+            local.dirty = true;
+            markRootDirty(local);
+            if (!localByKey.has(view.key)) {
+              localByKey.set(view.key, local);
+            }
+            syncedIssueKeys.add(view.key);
+            remoteMap.set(view.key, view);
+            writeLedgerFromRemote(workingLedger, key, view, now);
+            counts.createdRemote += 1;
+            actions.push({
+              kind: 'create-remote',
+              title: local.title,
+              issueKey: view.key,
+              detail: 'bound existing Tracker issue by title; wrote [ytracker::] field',
+            });
+            continue;
+          }
+        } catch (error) {
+          errors.push(
+            `Bind by summary "${local.title}": ${errorMessage(error)}`,
+          );
+        }
       }
 
       try {
@@ -475,9 +559,15 @@ export async function syncOneMapping(
         }
 
         local.issueKey = created.key;
+        if (external) {
+          local.ytrackerIssueKey = created.key;
+        }
         local.dirty = true;
         markRootDirty(local);
-        localByKey.set(created.key, local);
+        if (!localByKey.has(created.key)) {
+          localByKey.set(created.key, local);
+        }
+        syncedIssueKeys.add(created.key);
 
         if (!dryRun) {
           await runLabelReconcile(
@@ -517,7 +607,9 @@ export async function syncOneMapping(
           kind: 'create-remote',
           title: local.title,
           issueKey: created.key,
-          detail: 'unlinked checklist item in the note',
+          detail: external
+            ? 'created Tracker issue for external title link; wrote [ytracker::] field'
+            : 'unlinked checklist item in the note',
         });
       } catch (error) {
         errors.push(`Create remote "${local.title}": ${errorMessage(error)}`);
@@ -526,6 +618,21 @@ export async function syncOneMapping(
     }
 
     const issueKey = local.issueKey.toUpperCase();
+    if (syncedIssueKeys.has(issueKey)) {
+      // Same Tracker key appears on multiple checklist lines (different Jira
+      // URLs / descriptions). Syncing each would thrash push/pull forever.
+      counts.duplicateSkips += 1;
+      actions.push({
+        kind: 'duplicate-skip',
+        title: local.title,
+        issueKey,
+        detail:
+          'another checklist line already syncs this Tracker key; left this row unchanged',
+      });
+      continue;
+    }
+    syncedIssueKeys.add(issueKey);
+
     const remote = remoteMap.get(issueKey);
     const entry = workingLedger.entries[ledgerEntryKey(key, issueKey)];
 
@@ -555,34 +662,44 @@ export async function syncOneMapping(
 
     const localSnap = localSnapshot(local, parentIssueKey, entry);
     const remoteSnap = remoteSnapshot(remote);
-    const localHash = contentHash(localSnap);
-    const remoteHash = contentHash(remoteSnap);
+
+    // Both sides already agree on syncable fields (title/status/dates/…).
+    // Never report a conflict just because the ledger is missing/stale or the
+    // local snapshot has empty trackerStatus* before the first ledger write.
+    // Tag/assignee updates bump issue.updatedAt without changing contentHash —
+    // those must not look like remote edits either.
+    if (contentCoreEqual(localSnap, remoteSnap)) {
+      writeLedgerFromRemote(workingLedger, key, remote, now);
+      if (entry) {
+        entry.unresolved = false;
+      }
+      counts.unchanged += 1;
+      actions.push({ kind: 'unchanged', title: local.title, issueKey });
+      await runLabelReconcile(
+        options.client,
+        remote,
+        ctx,
+        dryRun,
+        counts,
+        actions,
+      );
+      await runAssigneeReconcile(
+        options.client,
+        local,
+        remote,
+        ctx,
+        dryRun,
+        counts,
+        actions,
+        errors,
+      );
+      runTimeSpentReconcile(local, remote, counts, actions);
+      continue;
+    }
 
     if (!entry) {
-      if (localHash === remoteHash) {
-        writeLedgerFromRemote(workingLedger, key, remote, now);
-        counts.unchanged += 1;
-        actions.push({ kind: 'unchanged', title: local.title, issueKey });
-        await runLabelReconcile(
-          options.client,
-          remote,
-          ctx,
-          dryRun,
-          counts,
-          actions,
-        );
-        await runAssigneeReconcile(
-          options.client,
-          local,
-          remote,
-          ctx,
-          dryRun,
-          counts,
-          actions,
-          errors,
-        );
-        runTimeSpentReconcile(local, remote, counts, actions);
-      } else if (options.conflictPolicy === 'prefer-obsidian') {
+      // First time we see this link and the sides disagree — adopt via policy.
+      if (options.conflictPolicy === 'prefer-obsidian') {
         await pushLocal(
           options,
           ctx,
@@ -608,6 +725,7 @@ export async function syncOneMapping(
           counts,
           actions,
           true,
+          options.siteBaseUrl,
         );
         await runLabelReconcile(
           options.client,
@@ -632,22 +750,27 @@ export async function syncOneMapping(
       continue;
     }
 
-    const localChanged = localHash !== entry.contentHash;
-    const remoteChanged =
-      remoteHash !== entry.contentHash || remote.updated !== entry.trackerUpdated;
+    // Core fields vs ledger (day-level dates, trimmed titles). Full contentHash
+    // still includes trackerStatus* for ledger storage, but column-id drift
+    // alone must not look like an Obsidian edit.
+    const entrySnap = snapshotFromLedger(entry);
+    const localChanged = !contentCoreEqual(localSnap, entrySnap);
+    const remoteChanged = !contentCoreEqual(remoteSnap, entrySnap);
 
     if (!localChanged && !remoteChanged) {
       entry.unresolved = false;
+      // Keep exact Tracker column identity + updatedAt fresh in the ledger.
+      writeLedgerFromRemote(workingLedger, key, remote, now);
       counts.unchanged += 1;
       actions.push({ kind: 'unchanged', title: local.title, issueKey });
       await runLabelReconcile(
-          options.client,
-          remote,
-          ctx,
-          dryRun,
-          counts,
-          actions,
-        );
+        options.client,
+        remote,
+        ctx,
+        dryRun,
+        counts,
+        actions,
+      );
       await runAssigneeReconcile(
         options.client,
         local,
@@ -691,15 +814,16 @@ export async function syncOneMapping(
         counts,
         actions,
         false,
+        options.siteBaseUrl,
       );
       await runLabelReconcile(
-          options.client,
-          remote,
-          ctx,
-          dryRun,
-          counts,
-          actions,
-        );
+        options.client,
+        remote,
+        ctx,
+        dryRun,
+        counts,
+        actions,
+      );
       await runAssigneeReconcile(
         options.client,
         local,
@@ -714,6 +838,7 @@ export async function syncOneMapping(
       continue;
     }
 
+    // True conflict: both sides disagree with the ledger AND with each other.
     if (options.conflictPolicy === 'prefer-obsidian') {
       await pushLocal(
         options,
@@ -740,15 +865,16 @@ export async function syncOneMapping(
         counts,
         actions,
         true,
+        options.siteBaseUrl,
       );
       await runLabelReconcile(
-          options.client,
-          remote,
-          ctx,
-          dryRun,
-          counts,
-          actions,
-        );
+        options.client,
+        remote,
+        ctx,
+        dryRun,
+        counts,
+        actions,
+      );
       await runAssigneeReconcile(
         options.client,
         local,
@@ -910,17 +1036,60 @@ async function pushLocal(
       startDate: local.startDate,
       dueDate: local.dueDate,
     });
+    const localDescription = normalizeDescription(
+      descriptionFromLines(local.descriptionLines),
+    );
 
     const wantedParent = parentIssueKey?.toUpperCase() ?? null;
     const remoteParent = remote.parentIssueKey?.toUpperCase() ?? null;
     const parentChanged = wantedParent !== remoteParent;
+    const summaryChanged = local.title.trim() !== remote.title.trim();
+    const descriptionChanged = localDescription !== remote.description;
+    const startChanged = syncCalendarDay(local.startDate) !== syncCalendarDay(remote.startDate);
+    const dueChanged = syncCalendarDay(local.dueDate) !== syncCalendarDay(remote.dueDate);
+    const statusChanged = status !== remote.status;
+    // Stale Tracker `end` still wins over deadline on read — clear it when due changes.
+    const clearEnd = dueChanged && remote.dueDateSource === 'end';
+    const contentChanged =
+      summaryChanged ||
+      descriptionChanged ||
+      startChanged ||
+      dueChanged ||
+      parentChanged ||
+      clearEnd;
 
-    if (!dryRun) {
+    if (!contentChanged && !statusChanged) {
+      // Ledger thought Obsidian moved, but Tracker already matches. Repair only.
+      writeLedgerFromRemote(ledger, key, remote, now);
+      counts.unchanged += 1;
+      actions.push({
+        kind: 'unchanged',
+        title: local.title,
+        issueKey: remote.key,
+        detail: 'Obsidian and Tracker already match; refreshed ledger',
+      });
+      await runLabelReconcile(options.client, remote, ctx, dryRun, counts, actions);
+      await runAssigneeReconcile(
+        options.client,
+        local,
+        remote,
+        ctx,
+        dryRun,
+        counts,
+        actions,
+        errors,
+      );
+      runTimeSpentReconcile(local, remote, counts, actions);
+      return;
+    }
+
+    if (!dryRun && contentChanged) {
       await options.client.updateIssue(remote.key, {
         summary: local.title,
         description: descriptionFromLines(local.descriptionLines),
         start: dates.start,
         deadline: dates.deadline,
+        ...(clearEnd ? { end: null } : {}),
         // Native Tracker parent (not Blocks links); only sent when it changes.
         parentKey: parentChanged ? wantedParent : undefined,
       });
@@ -930,7 +1099,7 @@ async function pushLocal(
     let trackerStatusId = remote.trackerStatusId;
     let trackerStatusName = remote.trackerStatusName;
 
-    if (status !== remote.status) {
+    if (statusChanged) {
       const targetColumn = pickColumnForCoarseStatus(ctx.columns, status, ctx.statusMeta);
       if (!targetColumn) {
         throw new Error(
@@ -1019,7 +1188,8 @@ async function pushLocal(
       local,
       parentIssueKey,
       status,
-      now(),
+      // Prefer Tracker's stamp; fall back to now only when the payload had none.
+      remote.updated || now(),
       trackerStatusId,
       trackerStatusName,
       now,
@@ -1058,6 +1228,7 @@ function pullRemote(
   counts: MappingSyncCounts,
   actions: SyncActionDetail[],
   isConflict: boolean,
+  siteBaseUrl: string,
 ): void {
   local.title = remote.title;
   local.descriptionLines = descriptionToLines(remote.description);
@@ -1066,6 +1237,13 @@ function pullRemote(
   local.startDate = remote.startDate;
   local.dueDate = remote.dueDate;
   local.issueKey = remote.key;
+  if (isExternalTitleLink(local, siteBaseUrl)) {
+    local.ytrackerIssueKey = remote.key;
+    // Keep external titleLinkUrl; only the display text (title) changes above.
+  } else {
+    local.titleLinkUrl = null;
+    local.ytrackerIssueKey = null;
+  }
   local.dirty = true;
   markRootDirty(local);
   writeLedgerFromRemote(ledger, key, remote, now);
@@ -1479,7 +1657,9 @@ function localSnapshot(
   }
   return contentSnapshot({
     title: local.title,
-    description: descriptionFromLines(local.descriptionLines),
+    // Match remote/ledger hashing (normalizeDescription) so whitespace/HTML
+    // round-trips do not look like perpetual local edits.
+    description: normalizeDescription(descriptionFromLines(local.descriptionLines)),
     status,
     trackerStatusId,
     trackerStatusName,
@@ -1513,6 +1693,11 @@ function fromParsed(node: ParsedTaskNode, parent: MutableTask | null): MutableTa
     title: node.title,
     descriptionLines: [...node.descriptionLines],
     issueKey: node.issueKey ? node.issueKey.toUpperCase() : null,
+    titleLinkUrl: node.titleLinkUrl,
+    ytrackerIssueKey: node.ytrackerIssueKey
+      ? node.ytrackerIssueKey.toUpperCase()
+      : null,
+    unknownInlineFields: [...node.unknownInlineFields],
     startDate: node.startDate,
     dueDate: node.dueDate,
     assignee: node.assignee,
@@ -1537,6 +1722,9 @@ function createLocalNode(remote: RemoteIssueView): MutableTask {
     title: remote.title,
     descriptionLines: descriptionToLines(remote.description),
     issueKey: remote.key,
+    titleLinkUrl: null,
+    ytrackerIssueKey: null,
+    unknownInlineFields: [],
     startDate: remote.startDate,
     dueDate: remote.dueDate,
     assignee: null,
@@ -1546,6 +1734,15 @@ function createLocalNode(remote: RemoteIssueView): MutableTask {
     isNew: true,
     dirty: true,
   };
+}
+
+/** True when the title is a markdown link that does not point at this Tracker site. */
+function isExternalTitleLink(task: MutableTask, siteBaseUrl: string): boolean {
+  const url = task.titleLinkUrl?.trim() ?? '';
+  if (!url) {
+    return false;
+  }
+  return extractIssueKeyFromUrl(url, siteBaseUrl) === null;
 }
 
 function walkMutable(roots: MutableTask[], visit: (task: MutableTask) => void): void {
@@ -1575,6 +1772,9 @@ function toRenderable(task: MutableTask): RenderableTask {
     checkboxChar: task.checkboxChar,
     title: task.title,
     issueKey: task.issueKey,
+    titleLinkUrl: task.titleLinkUrl,
+    ytrackerIssueKey: task.ytrackerIssueKey,
+    unknownInlineFields: task.unknownInlineFields,
     startDate: task.startDate,
     dueDate: task.dueDate,
     assignee: task.assignee,
@@ -1636,6 +1836,7 @@ function emptyCounts(): MappingSyncCounts {
     unchanged: 0,
     unresolvedRemovals: 0,
     recoveredPendingLinks: 0,
+    duplicateSkips: 0,
     labelReconciliations: 0,
     assigneeReconciliations: 0,
     timeSpentReconciliations: 0,
@@ -1652,6 +1853,7 @@ function addCounts(a: MappingSyncCounts, b: MappingSyncCounts): MappingSyncCount
     unchanged: a.unchanged + b.unchanged,
     unresolvedRemovals: a.unresolvedRemovals + b.unresolvedRemovals,
     recoveredPendingLinks: a.recoveredPendingLinks + b.recoveredPendingLinks,
+    duplicateSkips: a.duplicateSkips + b.duplicateSkips,
     labelReconciliations: a.labelReconciliations + b.labelReconciliations,
     assigneeReconciliations: a.assigneeReconciliations + b.assigneeReconciliations,
     timeSpentReconciliations: a.timeSpentReconciliations + b.timeSpentReconciliations,
@@ -1682,6 +1884,7 @@ function summarizeRun(
     countKind(actions, 'unresolved-missing-remote') +
     countKind(actions, 'unresolved-missing-local');
   const recovered = countKind(actions, 'recovered-pending');
+  const duplicates = countKind(actions, 'duplicate-skip');
   const labelFixes = countKind(actions, 'reconcile-labels');
   const assigneeFixes = countKind(actions, 'reconcile-assignee');
   const timeSpentFixes = countKind(actions, 'reconcile-timespent');
@@ -1708,11 +1911,18 @@ function summarizeRun(
   }
   if (conflicts > 0) {
     parts.push(
-      dryRun ? `${conflicts} would resolve conflict` : `${conflicts} conflict resolved`,
+      dryRun
+        ? `${conflicts} would resolve conflict${conflicts === 1 ? '' : 's'}`
+        : `${conflicts} conflict${conflicts === 1 ? '' : 's'} resolved`,
     );
   }
   if (recovered > 0) {
     parts.push(dryRun ? `${recovered} would relink` : `${recovered} relinked`);
+  }
+  if (duplicates > 0) {
+    parts.push(
+      `${duplicates} duplicate link${duplicates === 1 ? '' : 's'} skipped`,
+    );
   }
   if (labelFixes > 0) {
     parts.push(
@@ -1742,7 +1952,16 @@ function summarizeRun(
     parts.push(`${errorCount} error${errorCount === 1 ? '' : 's'}`);
   }
 
-  if (parts.length === 1 && totals.unchanged > 0) {
+  const hadMutations =
+    createRemote > 0 ||
+    createLocal > 0 ||
+    push > 0 ||
+    pull > 0 ||
+    conflicts > 0 ||
+    recovered > 0;
+  // Duplicates are informational; still show unchanged when that was the real work.
+  if (totals.unchanged > 0 && !hadMutations) {
+    // Idle / tag-only runs: surface that content was already in sync.
     parts.push(`${totals.unchanged} unchanged`);
   } else if (parts.length === 1) {
     parts.push('nothing to do');
