@@ -1,6 +1,6 @@
 {
   "name": "obsidian-yandex-tracker-sync",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Bidirectional sync between Obsidian checklist tasks and Yandex Tracker boards.",
   "main": "main.js",
   "type": "module",
